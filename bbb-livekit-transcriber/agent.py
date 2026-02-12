@@ -1,0 +1,298 @@
+"""BigBlueButton LiveKit Transcription Agent.
+
+Joins LiveKit rooms as a server-side participant, subscribes to audio tracks,
+performs speech-to-text using faster-whisper, and publishes transcription results
+to BBB's existing caption pipeline via Redis.
+
+Usage:
+    python agent.py start
+"""
+
+import asyncio
+import json
+import logging
+import os
+import numpy as np
+
+from livekit import agents, rtc
+from livekit.agents import AutoSubscribe, JobContext, AgentServer
+from livekit.plugins import silero
+
+from bbb_redis import BBBRedisPublisher
+from config import load_config
+from transcript_state import TranscriptStateManager
+
+logger = logging.getLogger("bbb-livekit-transcriber")
+logging.basicConfig(level=logging.INFO)
+
+# Global config loaded at startup
+_config: dict = {}
+_whisper_model = None
+
+
+def get_whisper_model():
+    """Lazy-load the faster-whisper model."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        stt_cfg = _config["stt"]
+        logger.info(
+            "Loading Whisper model=%s device=%s compute_type=%s",
+            stt_cfg["whisper_model"], stt_cfg["device"], stt_cfg["compute_type"],
+        )
+        _whisper_model = WhisperModel(
+            stt_cfg["whisper_model"],
+            device=stt_cfg["device"],
+            compute_type=stt_cfg["compute_type"],
+        )
+    return _whisper_model
+
+
+def audio_frames_to_ndarray(frames: list[rtc.AudioFrame], target_sample_rate: int = 16000) -> np.ndarray:
+    """Convert a list of LiveKit AudioFrames to a float32 numpy array.
+
+    Resamples to target_sample_rate if needed (faster-whisper expects 16kHz mono).
+    """
+    if not frames:
+        return np.array([], dtype=np.float32)
+
+    # Combine all frames into a single int16 array
+    all_samples = []
+    for frame in frames:
+        samples = np.frombuffer(frame.data, dtype=np.int16)
+        # If stereo, convert to mono by averaging channels
+        if frame.num_channels > 1:
+            samples = samples.reshape(-1, frame.num_channels).mean(axis=1).astype(np.int16)
+        all_samples.append(samples)
+    combined = np.concatenate(all_samples)
+
+    # Resample if source sample rate differs
+    source_rate = frames[0].sample_rate
+    if source_rate != target_sample_rate:
+        # Simple linear interpolation resampling
+        duration = len(combined) / source_rate
+        target_len = int(duration * target_sample_rate)
+        indices = np.linspace(0, len(combined) - 1, target_len)
+        combined = np.interp(indices, np.arange(len(combined)), combined.astype(np.float64)).astype(np.int16)
+
+    # Convert to float32 in [-1, 1] range
+    return combined.astype(np.float32) / 32768.0
+
+
+def parse_participant_metadata(participant: rtc.RemoteParticipant) -> dict:
+    """Parse BBB metadata from LiveKit participant."""
+    try:
+        return json.loads(participant.metadata) if participant.metadata else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+server = AgentServer()
+
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+    """Agent entrypoint - called when dispatched to a LiveKit room."""
+    redis_cfg = _config["redis"]
+    redis_pub = BBBRedisPublisher(host=redis_cfg["host"], port=redis_cfg["port"])
+    state_mgr = TranscriptStateManager()
+    vad = silero.VAD.load()
+    meeting_id = ctx.room.name
+
+    logger.info("Agent joining room %s (meeting_id=%s)", ctx.room.name, meeting_id)
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    # Track active transcription tasks per participant
+    active_tasks: dict[str, asyncio.Task] = {}
+
+    async def transcribe_track(
+        track: rtc.Track,
+        participant: rtc.RemoteParticipant,
+    ):
+        """Subscribe to an audio track and transcribe speech segments."""
+        user_id = participant.identity
+        logger.info("Starting transcription for participant %s (user_id=%s)", participant.name, user_id)
+
+        audio_stream = rtc.AudioStream(track)
+        vad_stream = vad.stream()
+
+        # Process audio frames through VAD in background
+        async def feed_audio():
+            async for frame_event in audio_stream:
+                vad_stream.push_frame(frame_event.frame)
+
+        feed_task = asyncio.create_task(feed_audio())
+
+        try:
+            async for vad_event in vad_stream:
+                if vad_event.type == agents.vad.VADEventType.END_OF_SPEECH:
+                    # vad_event.frames contains the audio frames for the speech segment
+                    speech_frames = getattr(vad_event, "frames", None) or []
+                    if not speech_frames:
+                        continue
+
+                    # Convert audio frames to numpy array for faster-whisper
+                    audio_data = audio_frames_to_ndarray(speech_frames)
+                    if len(audio_data) < 1600:  # Less than 0.1s at 16kHz
+                        continue
+
+                    # Run transcription in executor to avoid blocking the event loop.
+                    # faster-whisper's transcribe() returns (generator, info).
+                    # We must consume the generator to get all segments.
+                    def _transcribe(audio):
+                        seg_gen, info = get_whisper_model().transcribe(
+                            audio,
+                            beam_size=5,
+                            vad_filter=False,  # We already did VAD
+                        )
+                        parts = [s.text.strip() for s in seg_gen if s.text.strip()]
+                        lang = info.language if info.language else "en"
+                        return parts, lang
+
+                    loop = asyncio.get_event_loop()
+                    transcript_parts, detected_language = await loop.run_in_executor(
+                        None, _transcribe, audio_data,
+                    )
+
+                    if not transcript_parts:
+                        continue
+
+                    transcript = " ".join(transcript_parts)
+
+                    # Map whisper language code to BCP-47 locale
+                    locale = _whisper_lang_to_locale(detected_language)
+
+                    # Get participant state and generate transcript update
+                    state = state_mgr.get_or_create(user_id)
+                    state.new_utterance()
+                    start, end, text = state.finalize(transcript)
+
+                    logger.info(
+                        "Transcription [%s/%s] lang=%s: %s",
+                        meeting_id, user_id, locale, transcript,
+                    )
+
+                    await redis_pub.publish_transcript_update(
+                        meeting_id=meeting_id,
+                        user_id=user_id,
+                        transcript_id=state.transcript_id,
+                        start=start,
+                        end=end,
+                        text=text,
+                        transcript=transcript,
+                        locale=locale,
+                        is_final=True,
+                    )
+        except asyncio.CancelledError:
+            logger.info("Transcription cancelled for %s", user_id)
+        except Exception:
+            logger.exception("Error transcribing for %s", user_id)
+            await redis_pub.publish_transcription_error(
+                meeting_id=meeting_id,
+                user_id=user_id,
+                error_code="STT_ERROR",
+                error_message="Speech-to-text transcription failed",
+            )
+        finally:
+            feed_task.cancel()
+            await vad_stream.aclose()
+            await audio_stream.aclose()
+            state_mgr.remove(user_id)
+            logger.info("Stopped transcription for %s", user_id)
+
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+        if participant.identity in active_tasks:
+            return
+
+        task = asyncio.create_task(transcribe_track(track, participant))
+        active_tasks[participant.identity] = task
+
+    @ctx.room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        task = active_tasks.pop(participant.identity, None)
+        if task and not task.done():
+            task.cancel()
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant):
+        task = active_tasks.pop(participant.identity, None)
+        if task and not task.done():
+            task.cancel()
+
+    # Handle participants that are already in the room when the agent connects
+    for participant in ctx.room.remote_participants.values():
+        for publication in participant.track_publications.values():
+            if publication.track and publication.kind == rtc.TrackKind.KIND_AUDIO:
+                task = asyncio.create_task(
+                    transcribe_track(publication.track, participant)
+                )
+                active_tasks[participant.identity] = task
+
+
+def _whisper_lang_to_locale(lang_code: str) -> str:
+    """Map Whisper's ISO 639-1 language code to a BCP-47 locale.
+
+    faster-whisper returns short codes like 'en', 'es', 'fr'.
+    BBB caption system uses BCP-47 locales like 'en-US', 'es-ES', 'fr-FR'.
+    """
+    LANG_MAP = {
+        "en": "en-US",
+        "es": "es-ES",
+        "fr": "fr-FR",
+        "pt": "pt-BR",
+        "de": "de-DE",
+        "it": "it-IT",
+        "ja": "ja-JP",
+        "ko": "ko-KR",
+        "zh": "zh-CN",
+        "ru": "ru-RU",
+        "ar": "ar-SA",
+        "hi": "hi-IN",
+        "nl": "nl-NL",
+        "pl": "pl-PL",
+        "tr": "tr-TR",
+        "uk": "uk-UA",
+        "sv": "sv-SE",
+        "da": "da-DK",
+        "fi": "fi-FI",
+        "no": "nb-NO",
+        "cs": "cs-CZ",
+        "el": "el-GR",
+        "he": "he-IL",
+        "hu": "hu-HU",
+        "id": "id-ID",
+        "ms": "ms-MY",
+        "ro": "ro-RO",
+        "sk": "sk-SK",
+        "th": "th-TH",
+        "vi": "vi-VN",
+        "ca": "ca-ES",
+        "gl": "gl-ES",
+        "eu": "eu-ES",
+    }
+    return LANG_MAP.get(lang_code, f"{lang_code}-{lang_code.upper()}")
+
+
+if __name__ == "__main__":
+    _config = load_config()
+
+    # Set environment variables for the LiveKit agents framework.
+    # The framework reads LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+    # to connect to the LiveKit server. We use setdefault so explicit env vars
+    # take precedence over config file values.
+    os.environ.setdefault("LIVEKIT_URL", _config["livekit"]["url"])
+    os.environ.setdefault("LIVEKIT_API_KEY", _config["livekit"]["api_key"])
+    os.environ.setdefault("LIVEKIT_API_SECRET", _config["livekit"]["api_secret"])
+
+    agents.cli.run_app(server)
