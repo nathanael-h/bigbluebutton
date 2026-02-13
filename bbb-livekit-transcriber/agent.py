@@ -30,12 +30,11 @@ _config: dict = {}
 _whisper_model = None
 
 
-def get_whisper_model():
+def get_whisper_model(stt_cfg: dict):
     """Lazy-load the faster-whisper model."""
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        stt_cfg = _config["stt"]
         logger.info(
             "Loading Whisper model=%s device=%s compute_type=%s",
             stt_cfg["whisper_model"], stt_cfg["device"], stt_cfg["compute_type"],
@@ -93,7 +92,9 @@ server = AgentServer()
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
     """Agent entrypoint - called when dispatched to a LiveKit room."""
-    redis_cfg = _config["redis"]
+    # Load config in subprocess (LiveKit agents run jobs in separate processes)
+    config = load_config()
+    redis_cfg = config["redis"]
     redis_pub = BBBRedisPublisher(host=redis_cfg["host"], port=redis_cfg["port"])
     state_mgr = TranscriptStateManager()
     vad = silero.VAD.load()
@@ -140,7 +141,7 @@ async def entrypoint(ctx: JobContext):
                     # faster-whisper's transcribe() returns (generator, info).
                     # We must consume the generator to get all segments.
                     def _transcribe(audio):
-                        seg_gen, info = get_whisper_model().transcribe(
+                        seg_gen, info = get_whisper_model(config["stt"]).transcribe(
                             audio,
                             beam_size=5,
                             vad_filter=False,  # We already did VAD
