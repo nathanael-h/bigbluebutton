@@ -23,6 +23,7 @@ from livekit.plugins import silero
 
 from bbb_redis import BBBRedisPublisher
 from config import load_config
+from locale_tracker import LocaleTracker, bcp47_to_iso639
 from transcript_state import TranscriptStateManager
 
 logger = logging.getLogger("bbb-livekit-transcriber")
@@ -106,7 +107,8 @@ async def transcribe_via_api(
 ) -> str:
     """Transcribe audio using an OpenAI-compatible /v1/audio/transcriptions endpoint.
 
-    Returns the transcript text. Language is provided by the caller.
+    Returns the transcript text. Language is provided by the caller from the
+    user's BBB speech locale setting (via LocaleTracker).
     Compatible with speaches, openai, and any OpenAI-compatible STT API.
     """
     base_url = api_cfg["base_url"].rstrip("/")
@@ -145,6 +147,13 @@ async def entrypoint(ctx: JobContext):
     state_mgr = TranscriptStateManager()
     vad = silero.VAD.load()
 
+    # Track each user's speech locale from BBB's UserSpeechLocaleChangedEvtMsg events
+    locale_tracker = LocaleTracker(
+        meeting_id=meeting_id,
+        default_locale=stt_cfg.get("default_locale", "en-US"),
+    )
+    await locale_tracker.start(redis_cfg["host"], redis_cfg["port"])
+
     # Shared aiohttp session for API provider (None when using local faster-whisper)
     http_session = aiohttp.ClientSession() if use_api else None
 
@@ -180,40 +189,36 @@ async def entrypoint(ctx: JobContext):
                     if not speech_frames:
                         continue
 
+                    locale = locale_tracker.get_locale(user_id)
+                    lang_code = bcp47_to_iso639(locale)
+
                     if use_api:
                         wav = audio_frames_to_wav_bytes(speech_frames)
                         if len(wav) < 100:
                             continue
                         transcript = await transcribe_via_api(
-                            wav, "", stt_cfg["api"], http_session,
+                            wav, lang_code, stt_cfg["api"], http_session,
                         )
-                        locale = "en-US"
                     else:
-                        # Convert audio frames to numpy array for faster-whisper
+                        # Local faster-whisper path
                         audio_data = audio_frames_to_ndarray(speech_frames)
                         if len(audio_data) < 1600:  # Less than 0.1s at 16kHz
                             continue
 
-                        # Run transcription in executor to avoid blocking the event loop.
-                        # faster-whisper's transcribe() returns (generator, info).
-                        # We must consume the generator to get all segments.
                         def _transcribe(audio):
-                            seg_gen, info = get_whisper_model(stt_cfg).transcribe(
+                            seg_gen, _ = get_whisper_model(stt_cfg).transcribe(
                                 audio,
+                                language=lang_code or None,
                                 beam_size=5,
                                 vad_filter=False,  # We already did VAD
                             )
                             parts = [s.text.strip() for s in seg_gen if s.text.strip()]
-                            lang = info.language if info.language else "en"
-                            return " ".join(parts), lang
+                            return " ".join(parts)
 
                         loop = asyncio.get_event_loop()
-                        transcript, detected_language = await loop.run_in_executor(
+                        transcript = await loop.run_in_executor(
                             None, _transcribe, audio_data,
                         )
-
-                        # Map whisper language code to BCP-47 locale
-                        locale = _whisper_lang_to_locale(detected_language)
 
                     if not transcript:
                         continue
@@ -302,49 +307,6 @@ async def entrypoint(ctx: JobContext):
         if http_session is not None:
             await http_session.close()
 
-
-def _whisper_lang_to_locale(lang_code: str) -> str:
-    """Map Whisper's ISO 639-1 language code to a BCP-47 locale.
-
-    faster-whisper returns short codes like 'en', 'es', 'fr'.
-    BBB caption system uses BCP-47 locales like 'en-US', 'es-ES', 'fr-FR'.
-    """
-    LANG_MAP = {
-        "en": "en-US",
-        "es": "es-ES",
-        "fr": "fr-FR",
-        "pt": "pt-BR",
-        "de": "de-DE",
-        "it": "it-IT",
-        "ja": "ja-JP",
-        "ko": "ko-KR",
-        "zh": "zh-CN",
-        "ru": "ru-RU",
-        "ar": "ar-SA",
-        "hi": "hi-IN",
-        "nl": "nl-NL",
-        "pl": "pl-PL",
-        "tr": "tr-TR",
-        "uk": "uk-UA",
-        "sv": "sv-SE",
-        "da": "da-DK",
-        "fi": "fi-FI",
-        "no": "nb-NO",
-        "cs": "cs-CZ",
-        "el": "el-GR",
-        "he": "he-IL",
-        "hu": "hu-HU",
-        "id": "id-ID",
-        "ms": "ms-MY",
-        "ro": "ro-RO",
-        "sk": "sk-SK",
-        "th": "th-TH",
-        "vi": "vi-VN",
-        "ca": "ca-ES",
-        "gl": "gl-ES",
-        "eu": "eu-ES",
-    }
-    return LANG_MAP.get(lang_code, f"{lang_code}-{lang_code.upper()}")
 
 
 if __name__ == "__main__":

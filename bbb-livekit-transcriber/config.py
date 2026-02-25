@@ -26,6 +26,9 @@ DEFAULTS = {
     "stt": {
         # provider: "faster-whisper" (local) or "openai-compatible" (external HTTP API)
         "provider": "faster-whisper",
+        # Fallback locale (BCP-47) used before the user sets their language in BBB.
+        # Language is always taken from the user's BBB speech locale setting.
+        "default_locale": "en-US",
         # Settings for local faster-whisper
         "whisper_model": "tiny",
         "device": "cpu",
@@ -100,6 +103,7 @@ def load_config(config_path: str | None = None) -> dict:
         "REDIS_HOST": ("redis", "host"),
         "REDIS_PORT": ("redis", "port"),
         "STT_PROVIDER": ("stt", "provider"),
+        "STT_DEFAULT_LOCALE": ("stt", "default_locale"),
         "WHISPER_MODEL": ("stt", "whisper_model"),
         "WHISPER_DEVICE": ("stt", "device"),
         "WHISPER_COMPUTE_TYPE": ("stt", "compute_type"),
