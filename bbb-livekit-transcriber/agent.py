@@ -9,9 +9,12 @@ Usage:
 """
 
 import asyncio
-import json
+import io
 import logging
 import os
+import wave
+
+import aiohttp
 import numpy as np
 
 from livekit import agents, rtc
@@ -78,12 +81,51 @@ def audio_frames_to_ndarray(frames: list[rtc.AudioFrame], target_sample_rate: in
     return combined.astype(np.float32) / 32768.0
 
 
-def parse_participant_metadata(participant: rtc.RemoteParticipant) -> dict:
-    """Parse BBB metadata from LiveKit participant."""
-    try:
-        return json.loads(participant.metadata) if participant.metadata else {}
-    except (json.JSONDecodeError, TypeError):
-        return {}
+def audio_frames_to_wav_bytes(frames: list[rtc.AudioFrame], sample_rate: int = 16000) -> bytes:
+    """Convert LiveKit AudioFrames to a WAV file in memory.
+
+    The OpenAI-compatible /v1/audio/transcriptions endpoint accepts WAV files.
+    """
+    pcm = audio_frames_to_ndarray(frames, target_sample_rate=sample_rate)
+    pcm_int16 = (pcm * 32767).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # int16 = 2 bytes per sample
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_int16.tobytes())
+    return buf.getvalue()
+
+
+async def transcribe_via_api(
+    wav_bytes: bytes,
+    lang_code: str,
+    api_cfg: dict,
+    session: aiohttp.ClientSession,
+) -> str:
+    """Transcribe audio using an OpenAI-compatible /v1/audio/transcriptions endpoint.
+
+    Returns the transcript text. Language is provided by the caller.
+    Compatible with speaches, openai, and any OpenAI-compatible STT API.
+    """
+    base_url = api_cfg["base_url"].rstrip("/")
+    url = f"{base_url}/v1/audio/transcriptions"
+
+    form = aiohttp.FormData()
+    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+    form.add_field("model", api_cfg["model"])
+    form.add_field("response_format", "json")
+    if lang_code:
+        form.add_field("language", lang_code)
+
+    headers = {"Authorization": f"Bearer {api_cfg['api_key']}"}
+
+    async with session.post(url, data=form, headers=headers) as resp:
+        resp.raise_for_status()
+        result = await resp.json(content_type=None)
+
+    return result.get("text", "").strip()
 
 
 server = AgentServer()
@@ -95,10 +137,16 @@ async def entrypoint(ctx: JobContext):
     # Load config in subprocess (LiveKit agents run jobs in separate processes)
     config = load_config()
     redis_cfg = config["redis"]
+    stt_cfg = config["stt"]
+    use_api = stt_cfg["provider"] == "openai-compatible"
+    meeting_id = ctx.room.name
+
     redis_pub = BBBRedisPublisher(host=redis_cfg["host"], port=redis_cfg["port"])
     state_mgr = TranscriptStateManager()
     vad = silero.VAD.load()
-    meeting_id = ctx.room.name
+
+    # Shared aiohttp session for API provider (None when using local faster-whisper)
+    http_session = aiohttp.ClientSession() if use_api else None
 
     logger.info("Agent joining room %s (meeting_id=%s)", ctx.room.name, meeting_id)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -132,36 +180,43 @@ async def entrypoint(ctx: JobContext):
                     if not speech_frames:
                         continue
 
-                    # Convert audio frames to numpy array for faster-whisper
-                    audio_data = audio_frames_to_ndarray(speech_frames)
-                    if len(audio_data) < 1600:  # Less than 0.1s at 16kHz
-                        continue
-
-                    # Run transcription in executor to avoid blocking the event loop.
-                    # faster-whisper's transcribe() returns (generator, info).
-                    # We must consume the generator to get all segments.
-                    def _transcribe(audio):
-                        seg_gen, info = get_whisper_model(config["stt"]).transcribe(
-                            audio,
-                            beam_size=5,
-                            vad_filter=False,  # We already did VAD
+                    if use_api:
+                        wav = audio_frames_to_wav_bytes(speech_frames)
+                        if len(wav) < 100:
+                            continue
+                        transcript = await transcribe_via_api(
+                            wav, "", stt_cfg["api"], http_session,
                         )
-                        parts = [s.text.strip() for s in seg_gen if s.text.strip()]
-                        lang = info.language if info.language else "en"
-                        return parts, lang
+                        locale = "en-US"
+                    else:
+                        # Convert audio frames to numpy array for faster-whisper
+                        audio_data = audio_frames_to_ndarray(speech_frames)
+                        if len(audio_data) < 1600:  # Less than 0.1s at 16kHz
+                            continue
 
-                    loop = asyncio.get_event_loop()
-                    transcript_parts, detected_language = await loop.run_in_executor(
-                        None, _transcribe, audio_data,
-                    )
+                        # Run transcription in executor to avoid blocking the event loop.
+                        # faster-whisper's transcribe() returns (generator, info).
+                        # We must consume the generator to get all segments.
+                        def _transcribe(audio):
+                            seg_gen, info = get_whisper_model(stt_cfg).transcribe(
+                                audio,
+                                beam_size=5,
+                                vad_filter=False,  # We already did VAD
+                            )
+                            parts = [s.text.strip() for s in seg_gen if s.text.strip()]
+                            lang = info.language if info.language else "en"
+                            return " ".join(parts), lang
 
-                    if not transcript_parts:
+                        loop = asyncio.get_event_loop()
+                        transcript, detected_language = await loop.run_in_executor(
+                            None, _transcribe, audio_data,
+                        )
+
+                        # Map whisper language code to BCP-47 locale
+                        locale = _whisper_lang_to_locale(detected_language)
+
+                    if not transcript:
                         continue
-
-                    transcript = " ".join(transcript_parts)
-
-                    # Map whisper language code to BCP-47 locale
-                    locale = _whisper_lang_to_locale(detected_language)
 
                     # Get participant state and generate transcript update
                     state = state_mgr.get_or_create(user_id)
@@ -239,6 +294,13 @@ async def entrypoint(ctx: JobContext):
                     transcribe_track(publication.track, participant)
                 )
                 active_tasks[participant.identity] = task
+
+    # Wait until the job is done, then clean up the shared HTTP session
+    try:
+        await ctx.wait_for_disconnection()
+    finally:
+        if http_session is not None:
+            await http_session.close()
 
 
 def _whisper_lang_to_locale(lang_code: str) -> str:

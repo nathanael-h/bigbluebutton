@@ -24,10 +24,19 @@ DEFAULTS = {
         "port": 6379,
     },
     "stt": {
+        # provider: "faster-whisper" (local) or "openai-compatible" (external HTTP API)
         "provider": "faster-whisper",
-        "whisper_model": "base",
+        # Settings for local faster-whisper
+        "whisper_model": "tiny",
         "device": "cpu",
         "compute_type": "int8",
+        # Settings for openai-compatible external API (e.g. speaches, openai)
+        "api": {
+            "base_url": "http://localhost:8000",  # speaches default port
+            "api_key": "cant-be-empty",           # speaches doesn't need a real key
+            "model": "Systran/faster-whisper-base",  # speaches model name
+            "language": None,                     # None = auto-detect
+        },
     },
 }
 
@@ -94,13 +103,19 @@ def load_config(config_path: str | None = None) -> dict:
         "WHISPER_MODEL": ("stt", "whisper_model"),
         "WHISPER_DEVICE": ("stt", "device"),
         "WHISPER_COMPUTE_TYPE": ("stt", "compute_type"),
+        "STT_API_BASE_URL": ("stt", "api", "base_url"),
+        "STT_API_KEY": ("stt", "api", "api_key"),
+        "STT_API_MODEL": ("stt", "api", "model"),
+        "STT_API_LANGUAGE": ("stt", "api", "language"),
     }
-    for env_var, (section, key) in env_map.items():
+    for env_var, path in env_map.items():
         value = os.environ.get(env_var)
         if value is not None:
-            if key == "port":
-                config[section][key] = int(value)
-            else:
-                config[section][key] = value
+            # Navigate nested path like ("stt", "api", "base_url")
+            target = config
+            for key in path[:-1]:
+                target = target[key]
+            last_key = path[-1]
+            target[last_key] = int(value) if last_key == "port" else value
 
     return config
