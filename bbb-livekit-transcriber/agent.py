@@ -306,6 +306,10 @@ async def entrypoint(ctx: JobContext):
                     if not transcript:
                         continue
 
+                    # Prefix transcript with speaker name
+                    speaker_name = participant.name or user_id
+                    transcript = f"[{speaker_name}] {transcript}"
+
                     # Get participant state and generate transcript update
                     state = state_mgr.get_or_create(user_id)
                     state.new_utterance()

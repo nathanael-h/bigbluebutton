@@ -4,12 +4,12 @@ Tracks the current transcriptId and previous transcript text per participant,
 computes diffs for UpdateTranscriptPubMsg start/end/text fields.
 """
 
-import time
+import uuid
 
 
 def generate_transcript_id(user_id: str) -> str:
-    """Generate a unique transcript ID matching BBB's format: `{userId}-{timestamp}`."""
-    return f"{user_id}-{int(time.time() * 1000)}"
+    """Generate a unique transcript ID matching BBB's format: `{userId}-{hex}`."""
+    return f"{user_id}-{uuid.uuid4().hex[:12]}"
 
 
 def compute_diff(previous: str, current: str) -> tuple[int, int, str]:
