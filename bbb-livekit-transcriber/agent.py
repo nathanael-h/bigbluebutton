@@ -12,6 +12,8 @@ import asyncio
 import io
 import logging
 import os
+import re
+import threading
 import wave
 
 import aiohttp
@@ -41,22 +43,28 @@ os.environ.setdefault("LIVEKIT_API_SECRET", _startup_cfg["livekit"]["api_secret"
 
 
 _whisper_model = None
+_whisper_model_lock = threading.Lock()
 
 
 def get_whisper_model(stt_cfg: dict):
-    """Lazy-load the faster-whisper model."""
+    """Lazy-load the faster-whisper model (thread-safe).
+
+    Uses a lock to prevent multiple WhisperModel instances being constructed
+    concurrently when several participants start speaking at the same time.
+    """
     global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        logger.info(
-            "Loading Whisper model=%s device=%s compute_type=%s",
-            stt_cfg["whisper_model"], stt_cfg["device"], stt_cfg["compute_type"],
-        )
-        _whisper_model = WhisperModel(
-            stt_cfg["whisper_model"],
-            device=stt_cfg["device"],
-            compute_type=stt_cfg["compute_type"],
-        )
+    with _whisper_model_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+            logger.info(
+                "Loading Whisper model=%s device=%s compute_type=%s",
+                stt_cfg["whisper_model"], stt_cfg["device"], stt_cfg["compute_type"],
+            )
+            _whisper_model = WhisperModel(
+                stt_cfg["whisper_model"],
+                device=stt_cfg["device"],
+                compute_type=stt_cfg["compute_type"],
+            )
     return _whisper_model
 
 
@@ -117,8 +125,8 @@ _SAMPLE_EXPECTED = (
 
 def _word_overlap(a: str, b: str) -> float:
     """Return fraction of words in `b` that appear in `a` (case-insensitive, no punctuation)."""
-    import re
-    clean = lambda s: set(re.sub(r"[^\w\s]", "", s.lower()).split())
+    def clean(s):
+        return set(re.sub(r"[^\w\s]", "", s.lower()).split())
     words_a, words_b = clean(a), clean(b)
     if not words_b:
         return 0.0
@@ -150,7 +158,13 @@ async def check_stt_api(api_cfg: dict, session: aiohttp.ClientSession) -> None:
 
     async with session.post(url, data=form, headers=headers) as resp:
         resp.raise_for_status()
-        result = await resp.json(content_type=None)
+        try:
+            result = await resp.json()
+        except aiohttp.ContentTypeError:
+            body = await resp.text()
+            raise ValueError(
+                f"STT API returned unexpected Content-Type; body: {body[:200]!r}"
+            ) from None
 
     transcript = result.get("text", "").strip()
     similarity = _word_overlap(transcript, _SAMPLE_EXPECTED)
@@ -193,9 +207,29 @@ async def transcribe_via_api(
 
     async with session.post(url, data=form, headers=headers) as resp:
         resp.raise_for_status()
-        result = await resp.json(content_type=None)
+        try:
+            result = await resp.json()
+        except aiohttp.ContentTypeError:
+            body = await resp.text()
+            raise ValueError(
+                f"STT API returned unexpected Content-Type; body: {body[:200]!r}"
+            ) from None
 
     return result.get("text", "").strip()
+
+
+# Maximum audio segment size to prevent memory exhaustion from unbounded VAD buffers
+_MAX_AUDIO_SAMPLES = 60 * 16000        # 60 seconds at 16 kHz (local whisper path)
+_MAX_WAV_BYTES = _MAX_AUDIO_SAMPLES * 2 + 1024  # int16 bytes + WAV header overhead
+
+
+def _sanitize_for_log(s: str) -> str:
+    """Replace control characters in a string before writing to logs.
+
+    Prevents log injection via ANSI escape sequences or embedded newlines
+    in participant-supplied content (display names, locales, transcripts).
+    """
+    return re.sub(r'[\x00-\x1f\x7f]', '?', s)
 
 
 server = AgentServer()
@@ -232,13 +266,16 @@ async def entrypoint(ctx: JobContext):
     await locale_tracker.start(redis_cfg["host"], redis_cfg["port"])
 
     # Shared aiohttp session for API provider (None when using local faster-whisper)
-    http_session = aiohttp.ClientSession() if use_api else None
+    http_session = (
+        aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) if use_api else None
+    )
 
     if use_api:
         try:
             await check_stt_api(stt_cfg["api"], http_session)
         except Exception as exc:
             logger.error("STT API check FAILED: %s — transcription will not work", exc)
+            await http_session.close()
             raise
 
     logger.info("Agent joining room %s (meeting_id=%s)", ctx.room.name, meeting_id)
@@ -248,7 +285,7 @@ async def entrypoint(ctx: JobContext):
     active_tasks: dict[str, asyncio.Task] = {}
 
     # Shared utterance list for VTT export; populated by all transcribe_track coroutines
-    session_start = asyncio.get_event_loop().time()
+    session_start = asyncio.get_running_loop().time()
     utterances: list[dict] = []
 
     async def transcribe_track(
@@ -274,10 +311,10 @@ async def entrypoint(ctx: JobContext):
         try:
             async for vad_event in vad_stream:
                 if vad_event.type == agents.vad.VADEventType.START_OF_SPEECH:
-                    utt_start = asyncio.get_event_loop().time() - session_start
+                    utt_start = asyncio.get_running_loop().time() - session_start
 
                 elif vad_event.type == agents.vad.VADEventType.END_OF_SPEECH:
-                    utt_end = asyncio.get_event_loop().time() - session_start
+                    utt_end = asyncio.get_running_loop().time() - session_start
                     # vad_event.frames contains the audio frames for the speech segment
                     speech_frames = getattr(vad_event, "frames", None) or []
                     if not speech_frames:
@@ -289,6 +326,14 @@ async def entrypoint(ctx: JobContext):
                     if use_api:
                         wav = audio_frames_to_wav_bytes(speech_frames)
                         if len(wav) < 100:
+                            utt_start = None
+                            continue
+                        if len(wav) > _MAX_WAV_BYTES:
+                            logger.warning(
+                                "Audio segment too long (%d bytes) for %s, skipping",
+                                len(wav), user_id,
+                            )
+                            utt_start = None
                             continue
                         transcript = await transcribe_via_api(
                             wav, lang_code, stt_cfg["api"], http_session,
@@ -297,6 +342,14 @@ async def entrypoint(ctx: JobContext):
                         # Local faster-whisper path
                         audio_data = audio_frames_to_ndarray(speech_frames)
                         if len(audio_data) < 1600:  # Less than 0.1s at 16kHz
+                            utt_start = None
+                            continue
+                        if len(audio_data) > _MAX_AUDIO_SAMPLES:
+                            logger.warning(
+                                "Audio segment too long (%d samples) for %s, skipping",
+                                len(audio_data), user_id,
+                            )
+                            utt_start = None
                             continue
 
                         def _transcribe(audio):
@@ -309,7 +362,7 @@ async def entrypoint(ctx: JobContext):
                             parts = [s.text.strip() for s in seg_gen if s.text.strip()]
                             return " ".join(parts)
 
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         transcript = await loop.run_in_executor(
                             None, _transcribe, audio_data,
                         )
@@ -338,7 +391,10 @@ async def entrypoint(ctx: JobContext):
 
                     logger.info(
                         "Transcription [%s/%s] lang=%s: %s",
-                        meeting_id, user_id, locale, transcript,
+                        meeting_id,
+                        _sanitize_for_log(user_id),
+                        _sanitize_for_log(locale),
+                        _sanitize_for_log(transcript),
                     )
 
                     await redis_pub.publish_transcript_update(
@@ -364,6 +420,7 @@ async def entrypoint(ctx: JobContext):
             )
         finally:
             feed_task.cancel()
+            await asyncio.gather(feed_task, return_exceptions=True)
             await vad_stream.aclose()
             await audio_stream.aclose()
             state_mgr.remove(user_id)
@@ -417,6 +474,7 @@ async def entrypoint(ctx: JobContext):
     finally:
         write_vtt_files(meeting_id, utterances)
         await locale_tracker.stop()
+        await redis_pub.close()
         if http_session is not None:
             await http_session.close()
 
