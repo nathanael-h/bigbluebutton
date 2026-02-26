@@ -29,8 +29,15 @@ from transcript_state import TranscriptStateManager
 logger = logging.getLogger("bbb-livekit-transcriber")
 logging.basicConfig(level=logging.INFO)
 
-# Global config loaded at startup
-_config: dict = {}
+# Load config and set LiveKit env vars before AgentServer() is constructed.
+# AgentServer reads LIVEKIT_URL/API_KEY/API_SECRET at construction time, so they
+# must be present in the environment before the object is created. This runs in
+# every process (main worker and dev-mode subprocesses) on module import.
+_startup_cfg = load_config()
+os.environ.setdefault("LIVEKIT_URL", _startup_cfg["livekit"]["url"])
+os.environ.setdefault("LIVEKIT_API_KEY", _startup_cfg["livekit"]["api_key"])
+os.environ.setdefault("LIVEKIT_API_SECRET", _startup_cfg["livekit"]["api_secret"])
+
 _whisper_model = None
 
 
@@ -310,14 +317,4 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    _config = load_config()
-
-    # Set environment variables for the LiveKit agents framework.
-    # The framework reads LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
-    # to connect to the LiveKit server. We use setdefault so explicit env vars
-    # take precedence over config file values.
-    os.environ.setdefault("LIVEKIT_URL", _config["livekit"]["url"])
-    os.environ.setdefault("LIVEKIT_API_KEY", _config["livekit"]["api_key"])
-    os.environ.setdefault("LIVEKIT_API_SECRET", _config["livekit"]["api_secret"])
-
     agents.cli.run_app(server)
