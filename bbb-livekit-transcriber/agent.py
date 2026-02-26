@@ -38,6 +38,7 @@ os.environ.setdefault("LIVEKIT_URL", _startup_cfg["livekit"]["url"])
 os.environ.setdefault("LIVEKIT_API_KEY", _startup_cfg["livekit"]["api_key"])
 os.environ.setdefault("LIVEKIT_API_SECRET", _startup_cfg["livekit"]["api_secret"])
 
+
 _whisper_model = None
 
 
@@ -149,6 +150,15 @@ async def entrypoint(ctx: JobContext):
     stt_cfg = config["stt"]
     use_api = stt_cfg["provider"] == "openai-compatible"
     meeting_id = ctx.room.name
+
+    import copy, pprint
+    _log_cfg = copy.deepcopy(config)
+    for _s in ("api_key", "api_secret"):
+        if _log_cfg["livekit"].get(_s):
+            _log_cfg["livekit"][_s] = "***"
+    if _log_cfg["stt"].get("api", {}).get("api_key"):
+        _log_cfg["stt"]["api"]["api_key"] = "***"
+    logger.info("Effective config:\n%s", pprint.pformat(_log_cfg))
 
     redis_pub = BBBRedisPublisher(host=redis_cfg["host"], port=redis_cfg["port"])
     state_mgr = TranscriptStateManager()
