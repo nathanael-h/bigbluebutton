@@ -107,6 +107,65 @@ def audio_frames_to_wav_bytes(frames: list[rtc.AudioFrame], sample_rate: int = 1
     return buf.getvalue()
 
 
+_SAMPLE_WAV = os.path.join(os.path.dirname(__file__), "samples_jfk.wav")
+_SAMPLE_EXPECTED = (
+    "And so, my fellow Americans, ask not what your country can do for you, "
+    "ask what you can do for your country."
+)
+
+
+def _word_overlap(a: str, b: str) -> float:
+    """Return fraction of words in `b` that appear in `a` (case-insensitive, no punctuation)."""
+    import re
+    clean = lambda s: set(re.sub(r"[^\w\s]", "", s.lower()).split())
+    words_a, words_b = clean(a), clean(b)
+    if not words_b:
+        return 0.0
+    return len(words_a & words_b) / len(words_b)
+
+
+async def check_stt_api(api_cfg: dict, session: aiohttp.ClientSession) -> None:
+    """Verify the openai-compatible STT provider is reachable and produces correct output.
+
+    Sends samples_jfk.wav and checks the transcription against the known JFK quote.
+    Raises aiohttp.ClientResponseError on HTTP errors.
+    Logs a warning if transcription accuracy is low.
+    """
+    if not os.path.exists(_SAMPLE_WAV):
+        logger.warning("STT API check skipped: sample file not found at %s", _SAMPLE_WAV)
+        return
+
+    with open(_SAMPLE_WAV, "rb") as f:
+        wav_bytes = f.read()
+
+    base_url = api_cfg["base_url"].rstrip("/")
+    url = f"{base_url}/v1/audio/transcriptions"
+    form = aiohttp.FormData()
+    form.add_field("file", wav_bytes, filename="samples_jfk.wav", content_type="audio/wav")
+    form.add_field("model", api_cfg["model"])
+    form.add_field("response_format", "json")
+    form.add_field("language", "en")
+    headers = {"Authorization": f"Bearer {api_cfg['api_key']}"}
+
+    async with session.post(url, data=form, headers=headers) as resp:
+        resp.raise_for_status()
+        result = await resp.json(content_type=None)
+
+    transcript = result.get("text", "").strip()
+    similarity = _word_overlap(transcript, _SAMPLE_EXPECTED)
+
+    if similarity >= 0.8:
+        logger.info(
+            "STT API check OK (similarity=%.0f%%): %r",
+            similarity * 100, transcript,
+        )
+    else:
+        logger.warning(
+            "STT API check: low similarity=%.0f%% — got %r, expected %r",
+            similarity * 100, transcript, _SAMPLE_EXPECTED,
+        )
+
+
 async def transcribe_via_api(
     wav_bytes: bytes,
     lang_code: str,
@@ -173,6 +232,13 @@ async def entrypoint(ctx: JobContext):
 
     # Shared aiohttp session for API provider (None when using local faster-whisper)
     http_session = aiohttp.ClientSession() if use_api else None
+
+    if use_api:
+        try:
+            await check_stt_api(stt_cfg["api"], http_session)
+        except Exception as exc:
+            logger.error("STT API check FAILED: %s — transcription will not work", exc)
+            raise
 
     logger.info("Agent joining room %s (meeting_id=%s)", ctx.room.name, meeting_id)
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
