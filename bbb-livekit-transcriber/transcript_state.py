@@ -4,12 +4,20 @@ Tracks the current transcriptId and previous transcript text per participant,
 computes diffs for UpdateTranscriptPubMsg start/end/text fields.
 """
 
+import re
 import uuid
+
+_SAFE_ID_CHARS = re.compile(r'[^\w\-]')
 
 
 def generate_transcript_id(user_id: str) -> str:
-    """Generate a unique transcript ID matching BBB's format: `{userId}-{hex}`."""
-    return f"{user_id}-{uuid.uuid4().hex[:12]}"
+    """Generate a unique transcript ID matching BBB's format: `{userId}-{hex}`.
+
+    user_id is sanitized to contain only word characters and hyphens so that
+    the resulting transcript_id is safe to log and store.
+    """
+    safe_id = _SAFE_ID_CHARS.sub('_', user_id)
+    return f"{safe_id}-{uuid.uuid4().hex[:12]}"
 
 
 def compute_diff(previous: str, current: str) -> tuple[int, int, str]:
