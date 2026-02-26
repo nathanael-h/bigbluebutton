@@ -317,10 +317,15 @@ async def entrypoint(ctx: JobContext):
                 )
                 active_tasks[participant.identity] = task
 
-    # Wait until the job is done, then clean up the shared HTTP session
+    # Keep the job alive until the framework cancels it (room disconnected).
+    # ctx.wait_for_disconnection() does not exist in livekit-agents 1.x;
+    # awaiting a never-resolving Future is the standard pattern.
     try:
-        await ctx.wait_for_disconnection()
+        await asyncio.Future()
+    except asyncio.CancelledError:
+        pass
     finally:
+        await locale_tracker.stop()
         if http_session is not None:
             await http_session.close()
 
