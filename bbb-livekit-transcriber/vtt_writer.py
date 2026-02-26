@@ -7,11 +7,17 @@ directory, allowing caption export for every meeting (recorded or not).
 import json
 import logging
 import os
+import re
+import stat
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CAPTIONS_DIR = "/var/bigbluebutton/captions"
+
+# Allowlist patterns for filesystem-derived values
+_MEETING_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,256}$')
+_LOCALE_RE = re.compile(r'^[a-zA-Z]{2,8}(-[a-zA-Z0-9]{2,8})*$')
 
 # Maps BCP-47 language subtag to a human-readable name for captions.json.
 _LOCALE_NAMES = {
@@ -54,6 +60,20 @@ def _seconds_to_vtt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 
 
+def _escape_vtt(text: str) -> str:
+    """Escape text for safe inclusion in a WebVTT cue payload.
+
+    Prevents cue structure corruption and XSS when VTT files are served
+    directly in a browser context.
+    """
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Replace '-->' to prevent corrupting VTT cue timing lines
+    text = text.replace("-->", "- ->")
+    # Collapse newlines — bare newlines terminate VTT cues
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return text
+
+
 def write_vtt_files(
     meeting_id: str,
     utterances: list[dict],
@@ -67,14 +87,43 @@ def write_vtt_files(
       speaker     str    participant display name
       text        str    raw transcript text (no [speaker] prefix)
       locale      str    BCP-47 locale e.g. "fr-FR"
+
+    Errors are logged but not re-raised, since this is typically called from
+    a finally block where propagating exceptions would suppress prior errors.
     """
     if not utterances:
         logger.info("No utterances to export for meeting %s", meeting_id)
         return
 
+    try:
+        _write_vtt_files_impl(meeting_id, utterances, captions_dir)
+    except Exception:
+        logger.exception("Failed to write VTT files for meeting %s", meeting_id)
+
+
+def _write_vtt_files_impl(
+    meeting_id: str,
+    utterances: list[dict],
+    captions_dir: str | None,
+) -> None:
+    # Validate meeting_id against an allowlist before using it as a path component
+    if not _MEETING_ID_RE.match(meeting_id):
+        raise ValueError(f"Invalid meeting_id: {meeting_id!r}")
+
     base_dir = captions_dir or os.environ.get("BBB_CAPTIONS_DIR", DEFAULT_CAPTIONS_DIR)
-    out_dir = os.path.join(base_dir, meeting_id)
+    base_real = os.path.realpath(base_dir)
+    out_dir = os.path.realpath(os.path.join(base_dir, meeting_id))
+
+    # Belt-and-suspenders containment check after regex validation
+    if not out_dir.startswith(base_real + os.sep):
+        raise ValueError(f"meeting_id {meeting_id!r} escapes captions directory")
+
     os.makedirs(out_dir, exist_ok=True)
+    # Restrict directory to owner+group; transcripts are sensitive meeting content
+    try:
+        os.chmod(out_dir, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)  # 0o750
+    except OSError as e:
+        logger.warning("Could not set permissions on %s: %s", out_dir, e)
 
     # Group utterances by locale
     by_locale: dict[str, list[dict]] = defaultdict(list)
@@ -83,13 +132,25 @@ def write_vtt_files(
 
     written_locales = []
     for locale, cues in by_locale.items():
+        # Validate locale before using it in a filename
+        if not _LOCALE_RE.match(locale):
+            logger.warning("Skipping invalid locale %r for meeting %s", locale, meeting_id)
+            continue
+
         vtt_path = os.path.join(out_dir, f"caption_{locale}.vtt")
         lines = ["WEBVTT", ""]
         for cue in cues:
+            # WebVTT spec requires end > start; skip zero-duration cues
+            if cue["end_time"] <= cue["start_time"]:
+                logger.warning(
+                    "Skipping zero-duration cue for speaker %r (start=%.3f end=%.3f)",
+                    cue.get("speaker", "?"), cue["start_time"], cue["end_time"],
+                )
+                continue
             start = _seconds_to_vtt_timestamp(cue["start_time"])
             end = _seconds_to_vtt_timestamp(cue["end_time"])
-            speaker = cue["speaker"]
-            text = cue["text"]
+            speaker = _escape_vtt(cue["speaker"])
+            text = _escape_vtt(cue["text"])
             lines.append(f"{start} --> {end}")
             lines.append(f"[{speaker}] {text}")
             lines.append("")
@@ -102,10 +163,12 @@ def write_vtt_files(
     transcript_path = os.path.join(out_dir, "transcript.vtt")
     lines = ["WEBVTT", ""]
     for cue in sorted(utterances, key=lambda u: u["start_time"]):
+        if cue["end_time"] <= cue["start_time"]:
+            continue
         start = _seconds_to_vtt_timestamp(cue["start_time"])
         end = _seconds_to_vtt_timestamp(cue["end_time"])
         lines.append(f"{start} --> {end}")
-        lines.append(f"[{cue['speaker']}] {cue['text']}")
+        lines.append(f"[{_escape_vtt(cue['speaker'])}] {_escape_vtt(cue['text'])}")
         lines.append("")
     with open(transcript_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
