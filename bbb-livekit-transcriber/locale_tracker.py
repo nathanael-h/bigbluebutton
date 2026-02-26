@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 FROM_AKKA_CHANNEL = "from-akka-apps-redis-channel"
 LOCALE_CHANGED_EVENT = "UserSpeechLocaleChangedEvtMsg"
+MEETING_ENDED_EVENT = "MeetingEndedEvtMsg"
 
 
 class LocaleTracker:
@@ -25,6 +26,7 @@ class LocaleTracker:
         self._locales: dict[str, str] = {}  # userId -> BCP-47 locale e.g. "en-US"
         self._task: asyncio.Task | None = None
         self._redis: redis.Redis | None = None
+        self._meeting_ended = asyncio.Event()
 
     def get_locale(self, user_id: str) -> str:
         """Return the user's current locale, or the configured default."""
@@ -41,6 +43,10 @@ class LocaleTracker:
         self._redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         self._task = asyncio.create_task(self._subscribe())
         logger.info("LocaleTracker started for meeting %s (default: %s)", self._meeting_id, self._default_locale)
+
+    async def wait_for_meeting_end(self):
+        """Wait until a MeetingEndedEvtMsg is received for this meeting."""
+        await self._meeting_ended.wait()
 
     async def stop(self):
         if self._task and not self._task.done():
@@ -65,16 +71,24 @@ class LocaleTracker:
     def _handle_message(self, data: str):
         try:
             payload = json.loads(data)
-            if payload.get("envelope", {}).get("name") != LOCALE_CHANGED_EVENT:
-                return
-            header = payload["core"]["header"]
-            body = payload["core"]["body"]
-            if header.get("meetingId") != self._meeting_id:
-                return
-            user_id = header.get("userId", "")
-            locale = body.get("locale", "")
-            if user_id and locale:
-                self.set_locale(user_id, locale)
+            msg_name = payload.get("envelope", {}).get("name")
+
+            if msg_name == LOCALE_CHANGED_EVENT:
+                header = payload["core"]["header"]
+                body = payload["core"]["body"]
+                if header.get("meetingId") != self._meeting_id:
+                    return
+                user_id = header.get("userId", "")
+                locale = body.get("locale", "")
+                if user_id and locale:
+                    self.set_locale(user_id, locale)
+
+            elif msg_name == MEETING_ENDED_EVENT:
+                body = payload["core"]["body"]
+                if body.get("meetingId") == self._meeting_id:
+                    logger.info("Meeting ended: %s", self._meeting_id)
+                    self._meeting_ended.set()
+
         except (KeyError, json.JSONDecodeError, TypeError):
             pass
 

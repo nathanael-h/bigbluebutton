@@ -25,6 +25,7 @@ from bbb_redis import BBBRedisPublisher
 from config import load_config
 from locale_tracker import LocaleTracker, bcp47_to_iso639
 from transcript_state import TranscriptStateManager
+from vtt_writer import write_vtt_files
 
 logger = logging.getLogger("bbb-livekit-transcriber")
 logging.basicConfig(level=logging.INFO)
@@ -246,6 +247,10 @@ async def entrypoint(ctx: JobContext):
     # Track active transcription tasks per participant
     active_tasks: dict[str, asyncio.Task] = {}
 
+    # Shared utterance list for VTT export; populated by all transcribe_track coroutines
+    session_start = asyncio.get_event_loop().time()
+    utterances: list[dict] = []
+
     async def transcribe_track(
         track: rtc.Track,
         participant: rtc.RemoteParticipant,
@@ -264,9 +269,15 @@ async def entrypoint(ctx: JobContext):
 
         feed_task = asyncio.create_task(feed_audio())
 
+        utt_start: float | None = None
+
         try:
             async for vad_event in vad_stream:
-                if vad_event.type == agents.vad.VADEventType.END_OF_SPEECH:
+                if vad_event.type == agents.vad.VADEventType.START_OF_SPEECH:
+                    utt_start = asyncio.get_event_loop().time() - session_start
+
+                elif vad_event.type == agents.vad.VADEventType.END_OF_SPEECH:
+                    utt_end = asyncio.get_event_loop().time() - session_start
                     # vad_event.frames contains the audio frames for the speech segment
                     speech_frames = getattr(vad_event, "frames", None) or []
                     if not speech_frames:
@@ -306,8 +317,18 @@ async def entrypoint(ctx: JobContext):
                     if not transcript:
                         continue
 
-                    # Prefix transcript with speaker name
+                    # Save the raw transcript for VTT export before adding the speaker prefix
                     speaker_name = participant.name or user_id
+                    utterances.append({
+                        "start_time": utt_start if utt_start is not None else max(0.0, utt_end - 2.0),
+                        "end_time": utt_end,
+                        "speaker": speaker_name,
+                        "text": transcript,
+                        "locale": locale,
+                    })
+                    utt_start = None
+
+                    # Prefix transcript with speaker name for live captions
                     transcript = f"[{speaker_name}] {transcript}"
 
                     # Get participant state and generate transcript update
@@ -387,14 +408,14 @@ async def entrypoint(ctx: JobContext):
                 )
                 active_tasks[participant.identity] = task
 
-    # Keep the job alive until the framework cancels it (room disconnected).
-    # ctx.wait_for_disconnection() does not exist in livekit-agents 1.x;
-    # awaiting a never-resolving Future is the standard pattern.
+    # Keep the job alive until BBB ends the meeting or the framework cancels it.
+    # locale_tracker.wait_for_meeting_end() resolves when MeetingEndedEvtMsg arrives.
     try:
-        await asyncio.Future()
+        await locale_tracker.wait_for_meeting_end()
     except asyncio.CancelledError:
         pass
     finally:
+        write_vtt_files(meeting_id, utterances)
         await locale_tracker.stop()
         if http_session is not None:
             await http_session.close()
