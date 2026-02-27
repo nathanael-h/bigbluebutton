@@ -1,0 +1,35 @@
+[Unit]
+Description=BigBlueButton LiveKit Transcription Agent
+Documentation=https://github.com/bigbluebutton/bigbluebutton
+Wants=redis-server.service livekit-server.service bbb-apps-akka.service
+After=syslog.target network.target redis-server.service livekit-server.service bbb-apps-akka.service
+PartOf=bigbluebutton.target
+
+[Service]
+Type=simple
+User=bigbluebutton
+Group=bigbluebutton
+WorkingDirectory=/opt/bbb-livekit-transcriber
+Environment=PATH=/opt/bbb-livekit-transcriber/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HF_HOME=/opt/bbb-livekit-transcriber/.cache
+# Optional env-var overrides (not required if using /etc/bigbluebutton/bbb-livekit-transcriber.yml)
+EnvironmentFile=-/etc/bigbluebutton/bbb-livekit-transcriber.env
+ExecStart=/opt/bbb-livekit-transcriber/venv/bin/python agent.py start
+Restart=on-failure
+RestartSec=10
+SyslogIdentifier=bbb-livekit-transcriber
+
+# Security hardening
+# MemoryDenyWriteExecute and SystemCallFilter are intentionally omitted:
+# they break Python's ctypes/JIT and multiprocessing fork used by livekit-agents.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/bigbluebutton
+ReadWritePaths=/var/bigbluebutton/captions
+ReadWritePaths=/opt/bbb-livekit-transcriber
+ProtectHome=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target bigbluebutton.target

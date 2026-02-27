@@ -1,0 +1,57 @@
+# docker-compose.yml for bbb-livekit-transcriber
+#
+# Uses host networking so the container reaches Redis and LiveKit on the host
+# without any port mapping. This is the simplest configuration for a BBB server.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Prerequisites:
+#   - /etc/bigbluebutton/bbb-livekit-transcriber.yml configured (see README)
+#   - /var/bigbluebutton/captions/ writable by UID 999
+#     On a standard BBB host: id bigbluebutton  →  uid=999  (matches container user)
+
+services:
+  bbb-livekit-transcriber:
+    build:
+      context: .
+      # Uncomment to include local faster-whisper (~1.5 GB extra):
+      # args:
+      #   INSTALL_FASTER_WHISPER: "true"
+    image: bbb-livekit-transcriber:latest
+    container_name: bbb-livekit-transcriber
+    restart: unless-stopped
+    network_mode: host
+
+    # --- Config via mounted YAML files (recommended) ---
+    # config.py reads these paths automatically.
+    volumes:
+      - /etc/bigbluebutton/bbb-livekit-transcriber.yml:/etc/bigbluebutton/bbb-livekit-transcriber.yml:ro
+      - /etc/bigbluebutton/livekit.yaml:/etc/bigbluebutton/livekit.yaml:ro
+      - /var/bigbluebutton/captions:/var/bigbluebutton/captions
+      - transcriber-cache:/app/.cache
+
+    # --- Config via environment variables (alternative to YAML mounts) ---
+    # Remove the yml and livekit.yaml volume entries above, then uncomment below.
+    # Store secrets in a .env file next to docker-compose.yml (not committed to git).
+    # environment:
+    #   LIVEKIT_URL: ws://localhost:7880
+    #   LIVEKIT_API_KEY: "${LIVEKIT_API_KEY}"
+    #   LIVEKIT_API_SECRET: "${LIVEKIT_API_SECRET}"
+    #   STT_PROVIDER: openai-compatible
+    #   STT_API_BASE_URL: http://localhost:8000
+    #   STT_API_KEY: cant-be-empty
+    #   STT_API_MODEL: Systran/faster-whisper-base
+    #   STT_DEFAULT_LOCALE: en-US
+    #   REDIS_HOST: "127.0.0.1"
+    #   REDIS_PORT: "6379"
+
+    logging:
+      driver: journald
+      options:
+        tag: bbb-livekit-transcriber
+
+volumes:
+  transcriber-cache:
+    driver: local

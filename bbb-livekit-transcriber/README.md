@@ -31,20 +31,10 @@ Connects to any OpenAI-compatible `/v1/audio/transcriptions` endpoint. Works wit
 
 ## Prerequisites
 
-- Python 3.10+
 - BigBlueButton instance with LiveKit integration enabled (`audioBridge=livekit`)
 - Redis server (typically already running with BBB)
-
-## Installation
-
-```bash
-cd bbb-livekit-transcriber
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-For local faster-whisper only, `faster-whisper` is already in `requirements.txt`. For the external API provider, `aiohttp` handles the HTTP calls and is also included.
+- **Systemd deployment:** Python 3.10+
+- **Docker deployment:** Docker Engine and Docker Compose
 
 ## Configuration
 
@@ -163,55 +153,135 @@ The agent uses each participant's **BBB speech locale** setting as the transcrip
 
 > **Note**: Users must set their speech locale in the BBB captions UI for accurate transcription. If no locale is set, the agent falls back to `default_locale`.
 
-## Running the Agent
+## Production Deployment
+
+### Option 1: systemd (recommended for bare-metal/VM BBB installs)
+
+#### 1. Install the application
+
+```bash
+# Create the installation directory
+sudo mkdir -p /opt/bbb-livekit-transcriber
+sudo cp -r . /opt/bbb-livekit-transcriber/
+
+# Create the virtualenv and install dependencies as root
+sudo python3 -m venv /opt/bbb-livekit-transcriber/venv
+sudo /opt/bbb-livekit-transcriber/venv/bin/pip install -r /opt/bbb-livekit-transcriber/requirements.txt
+
+# Hand ownership of the directory to the bigbluebutton service account
+sudo chown -R bigbluebutton:bigbluebutton /opt/bbb-livekit-transcriber
+```
+
+#### 2. Configure
+
+Create `/etc/bigbluebutton/bbb-livekit-transcriber.yml` (see [Configuration](#configuration) above).
+
+LiveKit API credentials are read automatically from `/etc/bigbluebutton/livekit.yaml` — no extra steps needed on a standard BBB install.
+
+For environment-variable overrides (e.g. secrets not suitable for the YAML file), create `/etc/bigbluebutton/bbb-livekit-transcriber.env`:
+
+```bash
+# /etc/bigbluebutton/bbb-livekit-transcriber.env
+# LIVEKIT_API_KEY=...
+# LIVEKIT_API_SECRET=...
+```
+
+```bash
+sudo chmod 640 /etc/bigbluebutton/bbb-livekit-transcriber.env
+sudo chown root:bigbluebutton /etc/bigbluebutton/bbb-livekit-transcriber.env
+```
+
+#### 3. Install and enable the service
+
+```bash
+sudo cp /opt/bbb-livekit-transcriber/bbb-livekit-transcriber.service \
+        /etc/systemd/system/bbb-livekit-transcriber.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now bbb-livekit-transcriber
+```
+
+#### 4. Verify
+
+```bash
+sudo systemctl status bbb-livekit-transcriber
+journalctl -u bbb-livekit-transcriber -f
+```
+
+Logs should show `registered worker` followed by `Agent joining room <meeting_id>` when a meeting starts.
+
+---
+
+### Option 2: Docker
+
+The Docker image uses `network_mode: host` so the container reaches Redis and LiveKit on the host without any port mapping. The container runs as UID 999, which matches the `bigbluebutton` system user on a standard BBB host — so `/var/bigbluebutton/captions` permissions work without any `chown`.
+
+Verify the UID before starting:
+
+```bash
+id bigbluebutton   # should show uid=999
+```
+
+#### 1. Configure
+
+Create `/etc/bigbluebutton/bbb-livekit-transcriber.yml` as described in [Configuration](#configuration) above. The compose file mounts it read-only into the container.
+
+#### 2. Build and start
+
+```bash
+cd bbb-livekit-transcriber
+docker compose up -d --build
+```
+
+To include local faster-whisper (adds ~1.5 GB to the image), edit `docker-compose.yml` and uncomment the `INSTALL_FASTER_WHISPER: "true"` build arg before building.
+
+#### 3. Verify
+
+```bash
+docker compose ps
+docker compose logs -f
+```
+
+Logs should show `registered worker` followed by `Agent joining room <meeting_id>` when a meeting starts.
+
+#### Updating
+
+```bash
+docker compose pull   # if using a pre-built image
+# or
+docker compose up -d --build   # to rebuild from source
+```
+
+---
 
 ### Development (with auto-reload)
 
 ```bash
+cd bbb-livekit-transcriber
+python3 -m venv venv
 source venv/bin/activate
+pip install -r requirements.txt
 python agent.py dev
-```
-
-### Production
-
-```bash
-python agent.py start
-```
-
-### As a systemd service
-
-Create `/etc/systemd/system/bbb-livekit-transcriber.service`:
-
-```ini
-[Unit]
-Description=BigBlueButton LiveKit Transcription Agent
-After=network.target redis.service
-
-[Service]
-Type=simple
-User=bigbluebutton
-WorkingDirectory=/opt/bbb-livekit-transcriber
-Environment=PATH=/opt/bbb-livekit-transcriber/venv/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/opt/bbb-livekit-transcriber/venv/bin/python agent.py start
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now bbb-livekit-transcriber
-sudo systemctl status bbb-livekit-transcriber
 ```
 
 ## Testing
 
-1. Start the agent: `python agent.py dev`
+1. Start the agent (development: `python agent.py dev`, or check service is running)
 2. Create a BBB meeting with LiveKit audio enabled
 3. Open the captions panel in BBB and set your speech locale
 4. Speak — transcripts should appear in the caption panel
+
+Monitor agent logs:
+
+```bash
+# systemd
+journalctl -u bbb-livekit-transcriber -f
+
+# Docker
+docker compose logs -f
+
+# Development
+# (output is printed to the terminal)
+```
 
 Monitor Redis messages while speaking:
 
@@ -219,7 +289,7 @@ Monitor Redis messages while speaking:
 redis-cli SUBSCRIBE to-akka-apps-redis-channel
 ```
 
-Check agent logs for transcription output:
+Expected log output:
 
 ```text
 INFO:bbb-livekit-transcriber:Agent joining room <meeting_id>
@@ -298,13 +368,18 @@ bbb-livekit-transcriber (this agent)
 
 ```text
 bbb-livekit-transcriber/
-├── agent.py              # Main agent: VAD, STT, transcript publishing
-├── config.py             # Configuration loader (YAML + env vars)
-├── bbb_redis.py          # Redis publisher for BBB caption messages
-├── transcript_state.py   # Per-user transcription state and diff tracking
-├── locale_tracker.py     # Per-user speech locale from BBB Redis events
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
+├── agent.py                          # Main agent: VAD, STT, transcript publishing
+├── config.py                         # Configuration loader (YAML + env vars)
+├── bbb_redis.py                      # Redis publisher for BBB caption messages
+├── transcript_state.py               # Per-user transcription state and diff tracking
+├── locale_tracker.py                 # Per-user speech locale from BBB Redis events
+├── vtt_writer.py                     # WebVTT caption file export
+├── requirements.txt                  # Full Python dependencies (includes faster-whisper)
+├── requirements-docker.txt           # Docker dependencies (excludes faster-whisper)
+├── Dockerfile                        # Container image (Python 3.11-slim, non-root)
+├── docker-compose.yml                # Docker Compose for production deployment
+├── bbb-livekit-transcriber.service   # systemd unit file (ready to install)
+└── README.md                         # This file
 ```
 
 ## License

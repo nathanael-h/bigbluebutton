@@ -1,0 +1,8 @@
+# Dependencies for the Docker image.
+# Excludes faster-whisper — use provider: openai-compatible with an external STT server.
+# To include local faster-whisper, build with: --build-arg INSTALL_FASTER_WHISPER=true
+livekit-agents>=1.0
+livekit-plugins-silero>=1.0
+aiohttp>=3.9
+redis>=5.0
+pyyaml>=6.0
