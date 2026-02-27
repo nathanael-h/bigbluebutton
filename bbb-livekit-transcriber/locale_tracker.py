@@ -64,13 +64,24 @@ class LocaleTracker:
 
     async def _subscribe(self):
         while True:
+            if not self._redis:
+                logger.warning("Redis client missing for LocaleTracker, retrying in %ds", _RECONNECT_DELAY)
+                await asyncio.sleep(_RECONNECT_DELAY)
+                continue
             pubsub = self._redis.pubsub()
             try:
                 await pubsub.subscribe(FROM_AKKA_CHANNEL)
                 async for message in pubsub.listen():
                     if message["type"] != "message":
                         continue
-                    self._handle_message(message["data"])
+                    data = message.get("data")
+                    # pubsub may return bytes or str depending on client config
+                    if isinstance(data, bytes):
+                        try:
+                            data = data.decode("utf-8")
+                        except Exception:
+                            data = data.decode("utf-8", errors="replace")
+                    self._handle_message(data)
                 return  # listen() returned normally — connection closed cleanly
             except asyncio.CancelledError:
                 return
@@ -93,12 +104,20 @@ class LocaleTracker:
 
     def _handle_message(self, data: str):
         try:
+            if not isinstance(data, str):
+                # unexpected payload type
+                logger.debug("Ignoring non-text Redis message of type %s", type(data))
+                return
             payload = json.loads(data)
+            core = payload.get("core")
+            if not isinstance(core, dict):
+                logger.debug("Ignoring Redis message without core: %r", payload)
+                return
             msg_name = payload.get("envelope", {}).get("name")
 
             if msg_name == LOCALE_CHANGED_EVENT:
-                header = payload["core"]["header"]
-                body = payload["core"]["body"]
+                header = core.get("header", {})
+                body = core.get("body", {})
                 if header.get("meetingId") != self._meeting_id:
                     return
                 user_id = header.get("userId", "")
@@ -113,13 +132,15 @@ class LocaleTracker:
                     self.set_locale(user_id, locale)
 
             elif msg_name == MEETING_ENDED_EVENT:
-                body = payload["core"]["body"]
+                body = core.get("body", {})
                 if body.get("meetingId") == self._meeting_id:
                     logger.info("Meeting ended: %s", self._meeting_id)
                     self._meeting_ended.set()
 
-        except (KeyError, json.JSONDecodeError, TypeError) as e:
-            logger.debug("Ignoring malformed Redis message: %s", e)
+        except json.JSONDecodeError as e:
+            logger.debug("Ignoring malformed JSON Redis message: %s", e)
+        except Exception as e:
+            logger.debug("Ignoring unexpected Redis message error: %s", e)
 
 
 def bcp47_to_iso639(locale: str) -> str:
