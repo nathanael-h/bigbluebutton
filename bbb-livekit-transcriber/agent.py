@@ -370,32 +370,10 @@ async def entrypoint(ctx: JobContext):
                     if not transcript:
                         continue
 
-                    # Save the raw transcript for VTT export before adding the speaker prefix
-                    speaker_name = participant.name or user_id
-                    utterances.append({
-                        "start_time": utt_start if utt_start is not None else max(0.0, utt_end - 2.0),
-                        "end_time": utt_end,
-                        "speaker": speaker_name,
-                        "text": transcript,
-                        "locale": locale,
-                    })
-                    utt_start = None
-
-                    # Prefix transcript with speaker name for live captions
-                    transcript = f"[{speaker_name}] {transcript}"
-
-                    # Get participant state and generate transcript update
+                    # Live: publish to Redis as soon as transcript is ready
                     state = state_mgr.get_or_create(user_id)
                     state.new_utterance()
                     start, end, text = state.finalize(transcript)
-
-                    logger.info(
-                        "Transcription [%s/%s] lang=%s: %s",
-                        meeting_id,
-                        _sanitize_for_log(user_id),
-                        _sanitize_for_log(locale),
-                        _sanitize_for_log(transcript),
-                    )
 
                     await redis_pub.publish_transcript_update(
                         meeting_id=meeting_id,
@@ -408,6 +386,25 @@ async def entrypoint(ctx: JobContext):
                         locale=locale,
                         is_final=True,
                     )
+
+                    # Non-live: logging and VTT bookkeeping
+                    logger.info(
+                        "Transcription [%s/%s] lang=%s: %s",
+                        meeting_id,
+                        _sanitize_for_log(user_id),
+                        _sanitize_for_log(locale),
+                        _sanitize_for_log(transcript),
+                    )
+
+                    speaker_name = participant.name or user_id
+                    utterances.append({
+                        "start_time": utt_start if utt_start is not None else max(0.0, utt_end - 2.0),
+                        "end_time": utt_end,
+                        "speaker": speaker_name,
+                        "text": transcript,
+                        "locale": locale,
+                    })
+                    utt_start = None
         except asyncio.CancelledError:
             logger.info("Transcription cancelled for %s", user_id)
         except Exception:
