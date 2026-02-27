@@ -74,6 +74,7 @@ def _escape_vtt(text: str) -> str:
     return text
 
 
+
 def write_vtt_files(
     meeting_id: str,
     utterances: list[dict],
@@ -127,8 +128,15 @@ def _write_vtt_files_impl(
 
     # Group utterances by locale
     by_locale: dict[str, list[dict]] = defaultdict(list)
-    for utt in utterances:
-        by_locale[utt["locale"]].append(utt)
+    for i, utt in enumerate(utterances):
+        if not isinstance(utt, dict):
+            logger.warning("Skipping malformed utterance at index %d", i)
+            continue
+        locale = utt.get("locale")
+        if not locale or not isinstance(locale, str):
+            logger.warning("Skipping utterance with missing locale at index %d", i)
+            continue
+        by_locale[locale].append(utt)
 
     written_locales = []
     for locale, cues in by_locale.items():
@@ -140,39 +148,57 @@ def _write_vtt_files_impl(
         vtt_path = os.path.join(out_dir, f"caption_{locale}.vtt")
         lines = ["WEBVTT", ""]
         for cue in cues:
-            # WebVTT spec requires end > start; skip zero-duration cues
-            if cue["end_time"] <= cue["start_time"]:
+            try:
+                start_time = float(cue.get("start_time", -1))
+                end_time = float(cue.get("end_time", -1))
+            except (TypeError, ValueError):
+                logger.warning("Skipping cue with invalid timestamps: %r", cue)
+                continue
+            if end_time <= start_time:
                 logger.warning(
                     "Skipping zero-duration cue for speaker %r (start=%.3f end=%.3f)",
-                    cue.get("speaker", "?"), cue["start_time"], cue["end_time"],
+                    cue.get("speaker", "?"), start_time, end_time,
                 )
                 continue
-            start = _seconds_to_vtt_timestamp(cue["start_time"])
-            end = _seconds_to_vtt_timestamp(cue["end_time"])
-            speaker = _escape_vtt(cue["speaker"])
-            text = _escape_vtt(cue["text"])
+            start = _seconds_to_vtt_timestamp(start_time)
+            end = _seconds_to_vtt_timestamp(end_time)
+            speaker = _escape_vtt(str(cue.get("speaker", "")))
+            text = _escape_vtt(str(cue.get("text", "")))
             lines.append(f"{start} --> {end}")
             lines.append(f"[{speaker}] {text}")
             lines.append("")
-        with open(vtt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        try:
+            with open(vtt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception:
+            logger.exception("Failed to write VTT file %s", vtt_path)
+            continue
         written_locales.append(locale)
         logger.info("Wrote VTT for meeting=%s locale=%s (%d cues)", meeting_id, locale, len(cues))
 
     # Write unified transcript.vtt — all utterances sorted chronologically
     transcript_path = os.path.join(out_dir, "transcript.vtt")
     lines = ["WEBVTT", ""]
-    for cue in sorted(utterances, key=lambda u: u["start_time"]):
-        if cue["end_time"] <= cue["start_time"]:
+    for cue in sorted(utterances, key=lambda u: float(u.get("start_time", 0))):
+        try:
+            start_time = float(cue.get("start_time", -1))
+            end_time = float(cue.get("end_time", -1))
+        except (TypeError, ValueError):
             continue
-        start = _seconds_to_vtt_timestamp(cue["start_time"])
-        end = _seconds_to_vtt_timestamp(cue["end_time"])
+        if end_time <= start_time:
+            continue
+        start = _seconds_to_vtt_timestamp(start_time)
+        end = _seconds_to_vtt_timestamp(end_time)
         lines.append(f"{start} --> {end}")
-        lines.append(f"[{_escape_vtt(cue['speaker'])}] {_escape_vtt(cue['text'])}")
+        lines.append(f"[{_escape_vtt(str(cue.get('speaker', '')))}] {_escape_vtt(str(cue.get('text', '')))}")
         lines.append("")
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    logger.info("Wrote transcript.vtt for meeting=%s (%d cues total)", meeting_id, len(utterances))
+    try:
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except Exception:
+        logger.exception("Failed to write transcript.vtt %s", transcript_path)
+    else:
+        logger.info("Wrote transcript.vtt for meeting=%s (%d cues total)", meeting_id, len(utterances))
 
     # Write captions.json index
     captions_json = [
@@ -180,6 +206,10 @@ def _write_vtt_files_impl(
         for loc in sorted(written_locales)
     ]
     json_path = os.path.join(out_dir, "captions.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(captions_json, f, indent=2)
-    logger.info("Wrote captions.json for meeting=%s locales=%s", meeting_id, written_locales)
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(captions_json, f, indent=2)
+    except Exception:
+        logger.exception("Failed to write captions index %s", json_path)
+    else:
+        logger.info("Wrote captions.json for meeting=%s locales=%s", meeting_id, written_locales)
